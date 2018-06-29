@@ -75,6 +75,7 @@ int main ()
 
     //Data part
     data = datagram + sizeof(struct iphdr) + sizeof(struct udphdr);
+
     snprintf(data, 100, "%s", "ABCDEFGHIJKLMNOPQRSTUVWXYZ");
 
     //some address resolution
@@ -97,6 +98,7 @@ int main ()
     iph->daddr = sin.sin_addr.s_addr;
     iph->check = 0;      //Set to 0 before calculating checksum
     iph->check = 50;//csum ((unsigned short *) datagram, iph->tot_len); //Ip checksum
+
 
     //UDP header
     udph->source = htons (6666);
