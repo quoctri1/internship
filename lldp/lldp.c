@@ -288,29 +288,33 @@ static int get_ip_address (char *ip4_address)
 static int lldp_set_mngt_addr_tlv (unsigned char *buffer)
 {
     char ip4_address[20];
+    char lldp_mgnt_addr_buf[16];
+
+    unsigned int mgnt_addr;
+    unsigned int interface_number = 1;
 
     get_ip_address(ip4_address);
+    inet_aton(ip4_address, &mgnt_addr);
+    // struct lldp_mgnt_addr lldp_mgnt;
 
-    struct lldp_mgnt_addr lldp_mgnt;
+    // lldp_mgnt.addr_string_len = 1 + sizeof(lldp_mgnt.mgnt_addr);
+    lldp_mgnt_addr_buf[0] = 1 + 4;
+    lldp_mgnt_addr_buf[1] = 1;
+    memcpy(&lldp_mgnt_addr_buf[2], &mgnt_addr, 4);
+    lldp_mgnt_addr_buf[6] = 2;
 
-    lldp_mgnt.addr_string_len = 1 + sizeof(lldp_mgnt.mgnt_addr);
+    interface_number = htonl(1);
 
-    lldp_mgnt.addr_subtype = 1;
+    memcpy(&lldp_mgnt_addr_buf[7], &interface_number, 4);
 
-    inet_aton(ip4_address, &lldp_mgnt.mgnt_addr);
+    lldp_mgnt_addr_buf[11] = 0;
 
-    lldp_mgnt.interf_sub = 2;
+    // lldp_mgnt.len = lldp_mgnt.addr_string_len + sizeof(lldp_mgnt.interf_num) +
+    //         sizeof(lldp_mgnt.addr_subtype) + sizeof(lldp_mgnt.interf_sub) +
+    //             sizeof(lldp_mgnt.OID_string_len) + 1 + 1;
 
-    lldp_mgnt.interf_num = htonl(1);
-
-    lldp_mgnt.OID_string_len = 0;
-
-    lldp_mgnt.len = lldp_mgnt.addr_string_len + sizeof(lldp_mgnt.interf_num) +
-            sizeof(lldp_mgnt.addr_subtype) + sizeof(lldp_mgnt.interf_sub) +
-                sizeof(lldp_mgnt.OID_string_len) + 1 + 1;
-
-    // return lldp_add_tlv_mgnt_addr(LLDP_MANAGEMENT_ADDRESS, lldp_mgnt.len, &lldp_mgnt, buffer);
-    return lldp_add_tlv(LLDP_MANAGEMENT_ADDRESS, lldp_mgnt.len, &lldp_mgnt, buffer);
+    // return lldp_add_tlv_mgnt_addr(LLDP_MANAGEMENT_ADDRESS, 12, &lldp_mgnt_addr_buf, buffer);
+    return lldp_add_tlv(LLDP_MANAGEMENT_ADDRESS, 12, lldp_mgnt_addr_buf, buffer);
 }
 
 static void lldp_send_frame(struct sockaddr_ll socket_address, unsigned char *buffer,
