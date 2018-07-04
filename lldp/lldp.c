@@ -9,17 +9,25 @@
 #include <sys/ioctl.h>
 #include <net/if.h>
 #include <linux/if_arp.h>
-#include <sys/time.h>
-#include <signal.h>
+
+const unsigned char LLDP_DST_MAC[] = { 0x01, 0x80, 0xc2, 0x00, 0x00, 0x0e};
+const unsigned int  LLDP_ETH_TYPE  = 0x88cc;
+
+enum lldp_type {
+    LLDP_END_LLDPDU         = 0,
+    LLDP_CHASSIS_ID         = 1,
+    LLDP_PORT_ID            = 2,
+    LLDP_TIME_TO_LIVE       = 3,
+    LLDP_PORT_DESCRIPTION   = 4,
+    LLDP_SYSTEM_NAME        = 5,
+    LLDP_SYSTEM_DESCRIPTION = 6,
+    LLDP_SYSTEM_CAPABILITIES= 7,
+    LLDP_MANAGEMENT_ADDRESS = 8,
+};
 
 
-#define DEST0 0x01
-#define DEST1 0x80
-#define DEST2 0xc2
-#define DEST3 0x00
-#define DEST4 0x00
-#define DEST5 0x0e
-
+#define TRUE    1
+#define FALSE   0
 
 struct lldp_subtype
 {
@@ -28,99 +36,130 @@ struct lldp_subtype
     unsigned char  len;
 };
 
-static int add_tlv(unsigned int type, unsigned int length, void *value,
+struct lldp_mgnt_addr {
+    unsigned char addr_string_len;
+    unsigned char addr_subtype;
+    struct in_addr mgnt_addr;
+    unsigned char interf_sub;
+    unsigned int interf_num;
+    unsigned char OID_string_len;
+    unsigned char len;
+};
+
+static int lldp_add_tlv(unsigned int type, unsigned int length, void *value,
                     unsigned char *buffer);
-static void set_ethernet (unsigned char *request, struct ifreq ifr);
-static void get_MAC_address (struct ifreq *ifr, int *ifindex, const char * interface_name);
-static void set_socket_address (struct sockaddr_ll *socket_address, struct ifreq ifr,
-                            int ifindex);
-static int set_chassis (unsigned char *buffer);
-static int set_port (unsigned char *buffer);
-static int set_ttl (unsigned char *buffer, unsigned int time);
-static void send_req (struct sockaddr_ll socket_address, unsigned char *buffer,
+static void set_ethernet_header (unsigned char *frame, unsigned char hw_addr[]);
+static int  get_network_interface_info (const char * interface_name, unsigned char hw_addr[],
+                    int *interface_index);
+static void set_socket_address (struct sockaddr_ll *socket_address,
+            const unsigned char dst_hw_addr[], int interface_index);
+
+static int  lldp_set_chassis_tlv (unsigned char *buffer);
+static int  lldp_set_port_tlv (unsigned char *buffer);
+static int  lldp_set_time_to_live_tlv (unsigned char *buffer, unsigned int seconds);
+static int  lldp_set_system_desc_tlv (unsigned char *buffer);
+static int  lldp_set_system_name_tlv (unsigned char *buffer);
+static int  lldp_set_mngt_addr_tlv (unsigned char *buffer);
+static void lldp_send_frame (struct sockaddr_ll socket_address, unsigned char *buffer,
                     unsigned int total_len);
 
+/********************************************************************************/
 
-static int add_tlv(unsigned int type, unsigned int length,
-                    void *value, unsigned char *buffer) {
-    unsigned int type_len;
-    type_len = (type << 9) | (length & 0x1FF);
-    type_len = htons(type_len);
-    memcpy(buffer, &type_len, 2);
+static int lldp_add_tlv(unsigned int type, unsigned int length,
+                    void *value, unsigned char *buffer)
+{
+    unsigned int type_and_length;
+
+    type_and_length = (type << 9) | (length & 0x1FF);
+    type_and_length = htons(type_and_length);
+
+    memcpy(buffer, &type_and_length, 2);
     memcpy(buffer + 2 , value, length);
+
     return 2 + length;
 }
 
-static void set_ethernet (unsigned char *request, struct ifreq ifr) {
+static int lldp_add_tlv_mgnt_addr(unsigned int type, unsigned int length,
+                    void *value, unsigned char *buffer)
+{
+    unsigned int type_and_length;
 
-    struct ethhdr *send_req = (struct ethhdr *)request;
+    type_and_length = (type << 9) | (length & 0x1FF);
+    type_and_length = htons(type_and_length);
 
-    send_req->h_dest[0] = (unsigned char)DEST0;
-    send_req->h_dest[1] = (unsigned char)DEST1;
-    send_req->h_dest[2] = (unsigned char)DEST2;
-    send_req->h_dest[3] = (unsigned char)DEST3;
-    send_req->h_dest[4] = (unsigned char)DEST4;
-    send_req->h_dest[5] = (unsigned char)DEST5;
+    memcpy(buffer, &type_and_length, 2);
+    memcpy(buffer + 2 , value, 2);
+    memcpy(buffer + 4, value + 4, 4);
+    memcpy(buffer + 8, value + 8, length - 8);
 
-    send_req->h_source[0] = (unsigned char)ifr.ifr_hwaddr.sa_data[0];
-    send_req->h_source[1] = (unsigned char)ifr.ifr_hwaddr.sa_data[1];
-    send_req->h_source[2] = (unsigned char)ifr.ifr_hwaddr.sa_data[2];
-    send_req->h_source[3] = (unsigned char)ifr.ifr_hwaddr.sa_data[3];
-    send_req->h_source[4] = (unsigned char)ifr.ifr_hwaddr.sa_data[4];
-    send_req->h_source[5] = (unsigned char)ifr.ifr_hwaddr.sa_data[5];
-
-    send_req->h_proto = htons(0x88cc);
+    return 2 + length;
 }
 
-static void get_MAC_address (struct ifreq *ifr, int *ifindex, const char * interface_name) {
-    int sd;
-    sd = socket(AF_PACKET, SOCK_RAW, 0);
-    if (sd == -1) {
+
+static void set_ethernet_header (unsigned char *frame, unsigned char hw_addr[]) {
+
+    struct ethhdr *ethernet_header = (struct ethhdr *)frame;
+
+    memcpy(ethernet_header->h_dest, LLDP_DST_MAC, 6);
+    memcpy(ethernet_header->h_source, hw_addr, 6);
+
+    ethernet_header->h_proto = htons(LLDP_ETH_TYPE);
+}
+
+static int get_network_interface_info(const char *interface_name, unsigned char hw_addr[],
+                        int *interface_index)
+{
+    struct ifreq    ifr;
+    int             socket_fd;
+
+    socket_fd = socket(AF_PACKET, SOCK_RAW, 0);
+    if (socket_fd == -1) {
         perror("socket():");
-        close(sd);
-        return ;
+        close(socket_fd);
+        return FALSE;
     }
 
-    snprintf(ifr->ifr_name, 10, "%s", interface_name);
+    snprintf(ifr.ifr_name, IFNAMSIZ, "%s", interface_name);
 
-    if (ioctl(sd, SIOCGIFINDEX, ifr) == -1) {
+    if (ioctl(socket_fd, SIOCGIFINDEX, &ifr) == -1) {
         perror("SIOCGIFINDEX");
-        close(sd);
-        return ;
+        close(socket_fd);
+        return FALSE;
     }
 
-    *ifindex = ifr->ifr_ifindex;
+    *interface_index = ifr.ifr_ifindex;
 
-    if (ioctl(sd, SIOCGIFHWADDR, ifr) == -1) {
-        perror("SIOCGIFINDEX");
-        close(sd);
-        return ;
+    if (ioctl(socket_fd, SIOCGIFHWADDR, &ifr) == -1) {
+        perror("SIOCGIFHWADDR");
+        close(socket_fd);
+        return FALSE;
     }
 
-    close(sd);
+    memcpy(hw_addr, ifr.ifr_ifru.ifru_hwaddr.sa_data, 6);
+
+    close(socket_fd);
+
+    return TRUE;
 }
 
-static void set_socket_address (struct sockaddr_ll *socket_address, struct ifreq ifr,
-                            int ifindex) {
-    socket_address->sll_family = AF_PACKET;
-    socket_address->sll_protocol = 0x88cc;
-    socket_address->sll_ifindex = ifindex;
-    socket_address->sll_hatype = htons(ARPHRD_ETHER);
+static void set_socket_address(struct sockaddr_ll *socket_address,
+            const unsigned char dst_hw_addr[], int interface_index)
+{
+    socket_address->sll_family  = AF_PACKET;
+    socket_address->sll_protocol= LLDP_ETH_TYPE;
+    socket_address->sll_ifindex = interface_index;
+    socket_address->sll_hatype  = htons(ARPHRD_ETHER);
     socket_address->sll_pkttype = (PACKET_OTHERHOST);
-    socket_address->sll_halen = 6;
-    socket_address->sll_addr[0] = (unsigned char)ifr.ifr_hwaddr.sa_data[0];
-    socket_address->sll_addr[1] = (unsigned char)ifr.ifr_hwaddr.sa_data[1];
-    socket_address->sll_addr[2] = (unsigned char)ifr.ifr_hwaddr.sa_data[2];
-    socket_address->sll_addr[3] = (unsigned char)ifr.ifr_hwaddr.sa_data[3];
-    socket_address->sll_addr[4] = (unsigned char)ifr.ifr_hwaddr.sa_data[4];
-    socket_address->sll_addr[5] = (unsigned char)ifr.ifr_hwaddr.sa_data[5];
+    socket_address->sll_halen   = 6;
+    memcpy(socket_address->sll_addr, dst_hw_addr, 6);
 }
 
-static int set_chassis (unsigned char *buffer) {
+static int  lldp_set_chassis_tlv (unsigned char *buffer) {
     char hostname[20];
+
     if (gethostname(hostname, sizeof(hostname)) != 0) {
         perror("Error get hostname");
-        return 1;
+        return 0;
     }
     struct lldp_subtype lldp_chassis;
 
@@ -128,119 +167,208 @@ static int set_chassis (unsigned char *buffer) {
     snprintf(lldp_chassis.data, sizeof(lldp_chassis.data), "%s", hostname);
     lldp_chassis.len = 1 + strlen(hostname);
 
-    return add_tlv(1, lldp_chassis.len, &lldp_chassis, buffer);
+    return lldp_add_tlv(LLDP_CHASSIS_ID, lldp_chassis.len, &lldp_chassis, buffer);
 }
 
-static int set_port (unsigned char *buffer) {
+static int lldp_set_port_tlv (unsigned char *buffer) {
     struct lldp_subtype lldp_port;
     lldp_port.sub_type = 7;
     snprintf(lldp_port.data, sizeof(lldp_port.data), "%s", "PORT-1");
     lldp_port.len = 1 + strlen("PORT-1");
 
-    return add_tlv(2, lldp_port.len, &lldp_port, buffer);
+    return lldp_add_tlv(LLDP_PORT_ID, lldp_port.len, &lldp_port, buffer);
 }
 
-static int set_ttl (unsigned char *buffer, unsigned int time) {
-    unsigned int ttl = htons(time);
-    return add_tlv(3, 2, &ttl, buffer);
+static int lldp_set_time_to_live_tlv (unsigned char *buffer, unsigned int seconds) {
+    unsigned int ttl = htons(seconds);
+    return lldp_add_tlv(LLDP_TIME_TO_LIVE, 2, &ttl, buffer);
 }
 
-static void send_req (struct sockaddr_ll socket_address, unsigned char *buffer,
-                    unsigned int total_len) {
-    int num_send;
-    int sd = socket(AF_PACKET, SOCK_RAW, 0);
-    if (sd == -1) {
+static int get_ubuntu_version (char *ubuntu_version)
+{
+    char temp[100];
+
+    FILE *f = fopen("/etc/lsb-release", "r");
+
+    if (f == NULL) {
+        return FALSE;
+    }
+
+    while (fgets(temp, sizeof(temp), f) > 0) {
+        sscanf(temp, "DISTRIB_DESCRIPTION=%[^\n]", ubuntu_version);
+    }
+
+    //modify ubuntu version after get it
+    int element;
+    for (element = 0; element < strlen(ubuntu_version); element++) {
+        ubuntu_version[element] = ubuntu_version[element + 1];
+    }
+    ubuntu_version[strlen(ubuntu_version) - 1] = '\0';
+
+    fclose(f);
+
+    return TRUE;
+}
+
+static int get_CPU_name (char *CPU_name)
+{
+    char temp[100];
+    FILE *f = fopen("/proc/cpuinfo", "r");
+
+    if (f == NULL) {
+        return FALSE;
+    }
+
+    while (fgets(temp, sizeof(temp), f) > 0) {
+        sscanf(temp, "model name\t: %[^\n]", CPU_name);
+    }
+
+    return TRUE;
+}
+
+static int lldp_set_system_desc_tlv (unsigned char *buffer)
+{
+    char ubuntu_version[100];
+    char CPU_name[100];
+
+    get_ubuntu_version(ubuntu_version);
+
+    get_CPU_name(CPU_name);
+
+    struct lldp_subtype lldp_sys_desc;
+
+    snprintf(lldp_sys_desc.data, sizeof(lldp_sys_desc.data), "%s ", ubuntu_version);
+
+    strncat(lldp_sys_desc.data, CPU_name, sizeof(CPU_name));
+
+    lldp_sys_desc.len = strlen(lldp_sys_desc.data);
+
+    return lldp_add_tlv(LLDP_SYSTEM_DESCRIPTION, lldp_sys_desc.len, &lldp_sys_desc, buffer);
+}
+
+static int lldp_set_system_name_tlv (unsigned char *buffer) {
+
+    char hostname[64];
+
+    if (gethostname(hostname, sizeof(hostname)) != 0) {
+        perror("Error get hostname");
+        return 0;
+    }
+
+    return lldp_add_tlv(LLDP_SYSTEM_NAME, strlen(hostname), hostname, buffer);
+}
+
+static int get_ip_address (char *ip4_address)
+{
+    struct ifreq    ifr;
+    int fd;
+    fd = socket(PF_INET, SOCK_DGRAM, 0);
+
+    if (fd < 0 ) {
+        return FALSE;
+    }
+
+    ifr.ifr_addr.sa_family = AF_INET;
+    strncpy(ifr.ifr_name, "enp3s0", sizeof("enp3s0"));
+
+    if (ioctl(fd, SIOCGIFADDR, &ifr) == -1 ) {
+        perror("SIOCGIFADDR");
+        close(fd);
+        return FALSE;
+    }
+
+    snprintf(ip4_address, strlen(inet_ntoa(((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr)) + 1,
+            "%s", inet_ntoa(((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr));
+
+    close(fd);
+
+    return 1;
+}
+
+static int lldp_set_mngt_addr_tlv (unsigned char *buffer)
+{
+    char ip4_address[20];
+
+    get_ip_address(ip4_address);
+
+    struct lldp_mgnt_addr lldp_mgnt;
+
+    lldp_mgnt.addr_string_len = 1 + sizeof(lldp_mgnt.mgnt_addr);
+
+    lldp_mgnt.addr_subtype = 1;
+
+    inet_aton(ip4_address, &lldp_mgnt.mgnt_addr);
+
+    lldp_mgnt.interf_sub = 2;
+
+    lldp_mgnt.interf_num = htonl(1);
+
+    lldp_mgnt.OID_string_len = 0;
+
+    lldp_mgnt.len = lldp_mgnt.addr_string_len + sizeof(lldp_mgnt.interf_num) +
+            sizeof(lldp_mgnt.addr_subtype) + sizeof(lldp_mgnt.interf_sub) +
+                sizeof(lldp_mgnt.OID_string_len) + 1 + 1;
+
+    // return lldp_add_tlv_mgnt_addr(LLDP_MANAGEMENT_ADDRESS, lldp_mgnt.len, &lldp_mgnt, buffer);
+    return lldp_add_tlv(LLDP_MANAGEMENT_ADDRESS, lldp_mgnt.len, &lldp_mgnt, buffer);
+}
+
+static void lldp_send_frame(struct sockaddr_ll socket_address, unsigned char *buffer,
+                    unsigned int total_len)
+{
+    int socket_fd;
+
+    socket_fd = socket(AF_PACKET, SOCK_RAW, 0);
+    if (socket_fd == -1) {
         perror("socket():");
-        close(sd);
-        return ;
+        close(socket_fd);
+        return;
     }
 
-    if ((num_send = sendto(sd, buffer, total_len, 0,
-            (struct  sockaddr*)&socket_address, sizeof(socket_address))) < 0 ) {
-        printf("socket_address: %d\n", socket_address.sll_ifindex);
+    if (sendto(socket_fd, buffer, total_len, 0, (struct sockaddr*) &socket_address,
+                 sizeof(socket_address)) < 0) {
         perror("Error sendto");
-        close(sd);
-        return ;
+        close(socket_fd);
+        return;
     }
 
-    close(sd);
+    close(socket_fd);
 }
 
-static void set_timer (struct itimerval *it_val) {
-    if (signal(SIGALRM, (void)send_req) == SIG_ERR) {
-        perror("Unable to catch SIGALRM");
-        exit(1);
-    }
-
-    it_val->it_value.tv_sec =     2;
-    it_val->it_value.tv_usec =    100;
-    it_val->it_interval = it_val->it_value;
-
-    if (setitimer(ITIMER_REAL, it_val, NULL) == -1) {
-        perror("error calling setitimer()");
-        exit(1);
-    }
-}
+/********************************************************************************/
 
 int main(int argc, char const *argv[])
 {
-    int chassis_len, port_len, ttl_len, end_len;
-    struct sockaddr_ll           socket_address;
-    int                      ifindex, total_len;
-    unsigned char                   buffer[128];
-    struct                            ifreq ifr;
-    struct                     itimerval it_val;
+    int                 interface_index;
+    unsigned char       hw_addr[6];
+    struct sockaddr_ll  socket_address;
+    int                 total_len;
+    unsigned char       buffer[128];
 
     if (argc < 2) {
         perror("argv1");
         return 1;
     }
 
-    get_MAC_address(&ifr, &ifindex, argv[1]);
+    get_network_interface_info(argv[1], hw_addr, &interface_index);
 
-    set_socket_address(&socket_address, ifr, ifindex);
+    set_socket_address(&socket_address, LLDP_DST_MAC, interface_index);
 
     memset(buffer, 0, sizeof(buffer));
 
-    set_ethernet(buffer, ifr);
+    set_ethernet_header(buffer, hw_addr);
 
     total_len = sizeof(struct ethhdr);
 
-    chassis_len = set_chassis(buffer + total_len);
-    if (chassis_len < 0 ) {
-        fprintf(stderr, "Error set chassis\n");
-        exit(1);
-    }
-    total_len += chassis_len;
+    total_len += lldp_set_chassis_tlv(buffer + total_len);
+    total_len += lldp_set_port_tlv(buffer + total_len);
+    total_len += lldp_set_time_to_live_tlv(buffer + total_len, 120);
+    total_len += lldp_set_system_desc_tlv(buffer + total_len);
+    total_len += lldp_set_system_name_tlv(buffer + total_len);
+    total_len += lldp_set_mngt_addr_tlv(buffer + total_len);
+    total_len += lldp_add_tlv(LLDP_END_LLDPDU, 0, NULL, buffer + total_len);
 
-    port_len = set_port(buffer + total_len);
-    if (port_len < 0 ) {
-        fprintf(stderr, "Error set port\n");
-        exit(1);
-    }
-    total_len += port_len;
-
-    ttl_len = set_ttl(buffer + total_len, 120);
-    if (ttl_len < 0 ) {
-        fprintf(stderr, "Error set ttl\n");
-        exit(1);
-    }
-    total_len += ttl_len;
-
-    end_len = add_tlv(0, 0, NULL, buffer + total_len);
-    if (end_len < 0) {
-        fprintf(stderr, "Error set ends\n");
-        exit(1);
-    }
-    total_len += end_len;
-
-    send_req(socket_address, buffer, total_len);
-
-    set_timer(&it_val);
-
-    while (1) {
-        pause();
-    }
+    lldp_send_frame(socket_address, buffer, total_len);
 
     return 0;
 }
